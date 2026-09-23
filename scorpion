@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
 Scorpion: Image metadata and EXIF parser for 42 Cybersecurity Piscine.
+Includes bonus features:
+- Modifying and deleting EXIF metadata via CLI (-m / -d)
+- Graphical user interface for viewing and managing metadata (--gui)
 """
 
 import os
 import sys
+
+# Sanitize environment to prevent host snap container library conflicts
+for snap_var in ('GTK_PATH', 'GTK_EXE_PREFIX', 'GIO_MODULE_DIR', 'GSETTINGS_SCHEMA_DIR', 'GTK_IM_MODULE_FILE'):
+    os.environ.pop(snap_var, None)
+
 import argparse
 import datetime
 import mimetypes
@@ -12,6 +20,9 @@ from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 
 VALID_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.bmp')
+
+# Reverse lookup mapping from tag name (lowercase) to tag ID
+TAG_NAME_TO_ID = {name.lower(): tag_id for tag_id, name in TAGS.items()}
 
 
 def format_file_size(size_in_bytes):
@@ -105,6 +116,45 @@ def strip_image_metadata(filepath):
         return False
 
 
+def modify_image_metadata(filepath, modifications):
+    """Bonus feature: modify or add EXIF metadata tags on a given image file."""
+    try:
+        with Image.open(filepath) as img:
+            exif = img.getexif()
+            applied_changes = []
+
+            for mod in modifications:
+                if '=' not in mod:
+                    print(f"[-] Invalid modification syntax '{mod}'. Expected TAG=VALUE", file=sys.stderr)
+                    continue
+
+                tag_name_raw, tag_value = mod.split('=', 1)
+                tag_name_clean = tag_name_raw.strip()
+                tag_value = tag_value.strip()
+
+                if tag_name_clean.isdigit():
+                    tag_id = int(tag_name_clean)
+                else:
+                    tag_id = TAG_NAME_TO_ID.get(tag_name_clean.lower())
+
+                if tag_id is None:
+                    print(f"[-] Unknown EXIF tag name: '{tag_name_clean}'", file=sys.stderr)
+                    continue
+
+                exif[tag_id] = tag_value
+                applied_changes.append((TAGS.get(tag_id, str(tag_id)), tag_value))
+
+            if applied_changes:
+                img.save(filepath, exif=exif)
+                for tag_name, val in applied_changes:
+                    print(f"[✔] Modified '{tag_name}' = '{val}' on {filepath}")
+                return True
+            return False
+    except Exception as e:
+        print(f"[-] Failed to modify metadata for {filepath}: {e}", file=sys.stderr)
+        return False
+
+
 def display_metadata(filepath):
     """Print structured basic attributes and EXIF metadata to the console."""
     print("=" * 70)
@@ -164,6 +214,206 @@ def display_metadata(filepath):
     print()
 
 
+def launch_gui(initial_filepath=None):
+    """Launch the graphical interface (GUI) for viewing and managing metadata."""
+    try:
+        import gi
+        gi.require_version('Gtk', '3.0')
+        from gi.repository import Gtk
+    except Exception as e:
+        print(f"[-] Failed to load GTK 3: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    class ScorpionGUI(Gtk.Window):
+        def __init__(self, start_file=None):
+            super().__init__(title="Scorpion — Metadata Viewer & Manager")
+            self.set_default_size(750, 600)
+            self.set_position(Gtk.WindowPosition.CENTER)
+            self.current_file = None
+
+            # Main vertical layout container
+            main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            main_box.set_margin_start(12)
+            main_box.set_margin_end(12)
+            main_box.set_margin_top(12)
+            main_box.set_margin_bottom(12)
+            self.add(main_box)
+
+            # Top toolbar with Open button and current file label
+            top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            open_btn = Gtk.Button(label="📁 Open Image")
+            open_btn.connect("clicked", self.on_open_file_clicked)
+            top_bar.pack_start(open_btn, False, False, 0)
+
+            self.file_label = Gtk.Label(label="No image loaded")
+            self.file_label.set_xalign(0.0)
+            top_bar.pack_start(self.file_label, True, True, 0)
+            main_box.pack_start(top_bar, False, False, 0)
+
+            # Basic attributes info box
+            self.info_box = Gtk.Label(label="")
+            self.info_box.set_xalign(0.0)
+            main_box.pack_start(self.info_box, False, False, 0)
+
+            # Section label for EXIF table
+            exif_label = Gtk.Label(label="<b>EXIF &amp; Metadata Attributes:</b>", use_markup=True)
+            exif_label.set_xalign(0.0)
+            main_box.pack_start(exif_label, False, False, 0)
+
+            # TreeView table for metadata list (Tag Name, Value)
+            self.liststore = Gtk.ListStore(str, str)
+            self.treeview = Gtk.TreeView(model=self.liststore)
+
+            col_tag = Gtk.TreeViewColumn("Tag Name", Gtk.CellRendererText(), text=0)
+            col_tag.set_resizable(True)
+            col_tag.set_min_width(220)
+            self.treeview.append_column(col_tag)
+
+            col_val = Gtk.TreeViewColumn("Value", Gtk.CellRendererText(), text=1)
+            col_val.set_resizable(True)
+            self.treeview.append_column(col_val)
+
+            scrolled_window = Gtk.ScrolledWindow()
+            scrolled_window.set_vexpand(True)
+            scrolled_window.add(self.treeview)
+            main_box.pack_start(scrolled_window, True, True, 0)
+
+            # Edit / Modify section
+            edit_frame = Gtk.Frame(label=" Modify / Add EXIF Tag ")
+            edit_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            edit_box.set_margin_start(8)
+            edit_box.set_margin_end(8)
+            edit_box.set_margin_top(8)
+            edit_box.set_margin_bottom(8)
+            edit_frame.add(edit_box)
+
+            # Tag Name selector / entry
+            edit_box.pack_start(Gtk.Label(label="Tag:"), False, False, 0)
+            self.tag_entry = Gtk.ComboBoxText.new_with_entry()
+            common_tags = ["Artist", "Make", "Model", "Software", "Copyright", "DateTime", "ImageDescription"]
+            for ct in common_tags:
+                self.tag_entry.append_text(ct)
+            self.tag_entry.set_active(0)
+            edit_box.pack_start(self.tag_entry, False, False, 0)
+
+            # Value entry
+            edit_box.pack_start(Gtk.Label(label="Value:"), False, False, 0)
+            self.val_entry = Gtk.Entry()
+            self.val_entry.set_placeholder_text("Enter new tag value")
+            edit_box.pack_start(self.val_entry, True, True, 0)
+
+            # Save tag button
+            save_tag_btn = Gtk.Button(label="💾 Set Tag")
+            save_tag_btn.connect("clicked", self.on_save_tag_clicked)
+            edit_box.pack_start(save_tag_btn, False, False, 0)
+            main_box.pack_start(edit_frame, False, False, 0)
+
+            # Bottom action bar with Delete Metadata button and status bar
+            bottom_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            delete_btn = Gtk.Button(label="🗑️ Strip / Delete All Metadata")
+            delete_btn.connect("clicked", self.on_delete_metadata_clicked)
+            bottom_bar.pack_start(delete_btn, False, False, 0)
+
+            self.status_label = Gtk.Label(label="Ready.")
+            self.status_label.set_xalign(1.0)
+            bottom_bar.pack_start(self.status_label, True, True, 0)
+            main_box.pack_start(bottom_bar, False, False, 0)
+
+            self.connect("destroy", Gtk.main_quit)
+
+            if start_file and os.path.isfile(start_file):
+                self.load_image(start_file)
+
+        def on_open_file_clicked(self, widget):
+            dialog = Gtk.FileChooserDialog(
+                title="Select Image File",
+                parent=self,
+                action=Gtk.FileChooserAction.OPEN
+            )
+            dialog.add_buttons(
+                Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                Gtk.STOCK_OPEN, Gtk.ResponseType.OK
+            )
+            filter_img = Gtk.FileFilter()
+            filter_img.set_name("Image files (*.jpg, *.jpeg, *.png, *.gif, *.bmp)")
+            for ext in VALID_EXTENSIONS:
+                filter_img.add_pattern(f"*{ext}")
+                filter_img.add_pattern(f"*{ext.upper()}")
+            dialog.add_filter(filter_img)
+
+            response = dialog.run()
+            if response == Gtk.ResponseType.OK:
+                chosen_path = dialog.get_filename()
+                dialog.destroy()
+                self.load_image(chosen_path)
+            else:
+                dialog.destroy()
+
+        def load_image(self, filepath):
+            self.current_file = filepath
+            self.file_label.set_markup(f"<b>File:</b> {filepath}")
+            self.liststore.clear()
+
+            try:
+                attrs = get_basic_attributes(filepath)
+                with Image.open(filepath) as img:
+                    info_text = f"Format: {img.format} | Dimensions: {img.width}x{img.height} | Mode: {img.mode} | Size: {attrs['File Size']}"
+                    self.info_box.set_text(info_text)
+
+                    exif_dict, gps_dict = extract_image_exif(img)
+                    for k, v in sorted(exif_dict.items()):
+                        self.liststore.append([str(k), str(v)])
+                    for gk, gv in sorted(gps_dict.items()):
+                        self.liststore.append([f"GPS: {gk}", str(gv)])
+
+                    if hasattr(img, 'info') and img.info:
+                        for ik, iv in img.info.items():
+                            if ik not in ('exif', 'transparency') and isinstance(iv, (str, int, float)):
+                                self.liststore.append([f"Info: {ik}", str(iv)])
+
+                if len(self.liststore) == 0:
+                    self.status_label.set_text("Loaded image (No EXIF metadata present).")
+                else:
+                    self.status_label.set_text(f"Loaded {len(self.liststore)} metadata tag(s).")
+            except Exception as e:
+                self.status_label.set_text(f"Error loading image: {e}")
+
+        def on_save_tag_clicked(self, widget):
+            if not self.current_file:
+                self.status_label.set_text("Please open an image file first.")
+                return
+
+            tag_name = self.tag_entry.get_active_text()
+            tag_value = self.val_entry.get_text()
+
+            if not tag_name or not tag_value:
+                self.status_label.set_text("Please specify both tag name and value.")
+                return
+
+            success = modify_image_metadata(self.current_file, [f"{tag_name}={tag_value}"])
+            if success:
+                self.status_label.set_text(f"Updated tag '{tag_name}' successfully!")
+                self.load_image(self.current_file)
+            else:
+                self.status_label.set_text(f"Failed to update tag '{tag_name}'.")
+
+        def on_delete_metadata_clicked(self, widget):
+            if not self.current_file:
+                self.status_label.set_text("Please open an image file first.")
+                return
+
+            success = strip_image_metadata(self.current_file)
+            if success:
+                self.status_label.set_text("All metadata stripped successfully!")
+                self.load_image(self.current_file)
+            else:
+                self.status_label.set_text("Failed to strip metadata.")
+
+    app = ScorpionGUI(initial_filepath)
+    app.show_all()
+    Gtk.main()
+
+
 def parse_arguments():
     """Parse command line arguments for scorpion."""
     parser = argparse.ArgumentParser(
@@ -172,7 +422,7 @@ def parse_arguments():
     )
     parser.add_argument(
         "files",
-        nargs="+",
+        nargs="*",
         metavar="FILE",
         help="One or more image files to analyze."
     )
@@ -182,15 +432,41 @@ def parse_arguments():
         dest="delete_metadata",
         help="Bonus: Strip and delete metadata from the specified image files."
     )
+    parser.add_argument(
+        "-m", "--modify",
+        action="append",
+        dest="modifications",
+        metavar="TAG=VALUE",
+        help="Bonus: Modify or add EXIF tag(s) on target file(s) (e.g. -m 'Artist=Alice')."
+    )
+    parser.add_argument(
+        "-g", "--gui",
+        action="store_true",
+        dest="launch_gui",
+        help="Bonus: Launch the graphical interface for viewing and managing metadata."
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_arguments()
 
+    if args.launch_gui:
+        initial_file = args.files[0] if args.files else None
+        launch_gui(initial_file)
+        return
+
+    if not args.files:
+        print("usage: scorpion [-h] [-d] [-m TAG=VALUE] [-g] [FILE ...]")
+        print("scorpion: error: the following arguments are required: FILE (or use -g/--gui)")
+        sys.exit(1)
+
     for file_path in args.files:
         if args.delete_metadata:
             strip_image_metadata(file_path)
+        elif args.modifications:
+            modify_image_metadata(file_path, args.modifications)
+            display_metadata(file_path)
         else:
             display_metadata(file_path)
 
