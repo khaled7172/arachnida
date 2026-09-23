@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""
+Spider: A recursive web crawler and image extractor for 42 Cybersecurity Piscine.
+"""
+
+import os
+import sys
+import argparse
+import hashlib
+from urllib.parse import urlparse, urljoin, unquote
+from collections import deque
+import requests
+from bs4 import BeautifulSoup
+
+VALID_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.bmp')
+DEFAULT_SAVE_DIR = './data/'
+DEFAULT_MAX_DEPTH = 5
+REQUEST_TIMEOUT = 10
+USER_AGENT = "SpiderBot/1.0 (+https://github.com/khaled7172/aranchida)"
+
+
+def parse_arguments():
+    """Parse and validate command line arguments."""
+    parser = argparse.ArgumentParser(
+        prog="spider",
+        description="Extract images from a website recursively."
+    )
+    parser.add_argument(
+        "-r",
+        action="store_true",
+        dest="recursive",
+        help="Recursively download images from linked pages."
+    )
+    parser.add_argument(
+        "-l",
+        type=int,
+        default=DEFAULT_MAX_DEPTH,
+        dest="depth",
+        metavar="N",
+        help=f"Maximum recursion depth level (default: {DEFAULT_MAX_DEPTH})."
+    )
+    parser.add_argument(
+        "-p",
+        type=str,
+        default=DEFAULT_SAVE_DIR,
+        dest="path",
+        metavar="PATH",
+        help=f"Path where downloaded files will be saved (default: {DEFAULT_SAVE_DIR})."
+    )
+    parser.add_argument(
+        "url",
+        type=str,
+        metavar="URL",
+        help="Target URL to scrape."
+    )
+
+    args = parser.parse_args()
+
+    if args.depth < 0:
+        parser.error("Recursion depth level must be a non-negative integer.")
+
+    return args
+
+
+def is_valid_image_url(url):
+    """Check if the URL path ends with a valid supported image extension."""
+    parsed = urlparse(url)
+    clean_path = unquote(parsed.path).lower()
+    return any(clean_path.endswith(ext) for ext in VALID_EXTENSIONS)
+
+
+def is_same_domain(base_netloc, target_url):
+    """Verify if target_url belongs to the same domain as the starting URL."""
+    target_netloc = urlparse(target_url).netloc
+    return base_netloc.lower() == target_netloc.lower()
+
+
+def sanitize_filename(url, save_dir):
+    """Generate a clean, collision-free local filename for an image URL."""
+    parsed = urlparse(url)
+    base_name = os.path.basename(unquote(parsed.path))
+    if not base_name or not any(base_name.lower().endswith(ext) for ext in VALID_EXTENSIONS):
+        ext = ".jpg"
+        for candidate_ext in VALID_EXTENSIONS:
+            if candidate_ext in url.lower():
+                ext = candidate_ext
+                break
+        url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()[:8]
+        base_name = f"image_{url_hash}{ext}"
+
+    name, ext = os.path.splitext(base_name)
+    file_path = os.path.join(save_dir, base_name)
+    counter = 1
+    while os.path.exists(file_path):
+        file_path = os.path.join(save_dir, f"{name}_{counter}{ext}")
+        counter += 1
+    return file_path
+
+
+def download_image(img_url, save_dir, session, downloaded_hashes):
+    """Download an image if valid and not previously downloaded."""
+    try:
+        response = session.get(img_url, timeout=REQUEST_TIMEOUT, stream=True)
+        if response.status_code != 200:
+            return False
+
+        content_type = response.headers.get('Content-Type', '').lower()
+        if 'text/html' in content_type:
+            return False
+
+        img_bytes = response.content
+        if len(img_bytes) == 0:
+            return False
+
+        img_hash = hashlib.sha256(img_bytes).hexdigest()
+        if img_hash in downloaded_hashes:
+            return False
+
+        file_path = sanitize_filename(img_url, save_dir)
+        with open(file_path, 'wb') as f:
+            f.write(img_bytes)
+
+        downloaded_hashes.add(img_hash)
+        print(f"[+] Downloaded: {img_url} -> {file_path}")
+        return True
+    except Exception as e:
+        print(f"[-] Failed to download image {img_url}: {e}", file=sys.stderr)
+        return False
+
+
+def extract_page_assets(current_url, html_text, base_netloc):
+    """Parse HTML and extract valid image URLs and child page links."""
+    soup = BeautifulSoup(html_text, 'html.parser')
+    image_urls = set()
+    page_urls = set()
+
+    # Find images in <img> tags
+    for img in soup.find_all('img'):
+        src = img.get('src') or img.get('data-src')
+        if src:
+            full_img_url = urljoin(current_url, src.strip())
+            if is_valid_image_url(full_img_url):
+                image_urls.add(full_img_url)
+
+    # Find images in <source> tags (srcset)
+    for source in soup.find_all('source'):
+        srcset = source.get('srcset')
+        if srcset:
+            first_candidate = srcset.split(',')[0].strip().split(' ')[0]
+            full_img_url = urljoin(current_url, first_candidate)
+            if is_valid_image_url(full_img_url):
+                image_urls.add(full_img_url)
+
+    # Find links in <a> tags
+    for a_tag in soup.find_all('a', href=True):
+        href = a_tag['href'].strip()
+        if not href or href.startswith('#') or href.startswith('javascript:'):
+            continue
+        full_url = urljoin(current_url, href)
+        parsed = urlparse(full_url)
+        if parsed.scheme not in ('http', 'https'):
+            continue
+        # If link points directly to an image
+        if is_valid_image_url(full_url):
+            image_urls.add(full_url)
+        elif is_same_domain(base_netloc, full_url):
+            clean_url = full_url.split('#')[0]
+            page_urls.add(clean_url)
+
+    return image_urls, page_urls
+
+
+def crawl(start_url, recursive, max_depth, save_dir):
+    """Run breadth-first crawl to extract and download images."""
+    os.makedirs(save_dir, exist_ok=True)
+    parsed_start = urlparse(start_url)
+    if not parsed_start.scheme or not parsed_start.netloc:
+        print(f"Error: Invalid URL '{start_url}'. Must include http:// or https://", file=sys.stderr)
+        sys.exit(1)
+
+    base_netloc = parsed_start.netloc
+    effective_max_depth = max_depth if recursive else 0
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+
+    visited_pages = set()
+    discovered_images = set()
+    downloaded_hashes = set()
+    queue = deque([(start_url, 0)])
+
+    print(f"[*] Starting spider crawl on {start_url}")
+    print(f"[*] Recursive: {recursive} | Max Depth: {effective_max_depth} | Save Directory: {save_dir}")
+
+    total_downloaded = 0
+
+    while queue:
+        current_url, depth = queue.popleft()
+
+        if current_url in visited_pages:
+            continue
+        visited_pages.add(current_url)
+
+        print(f"[*] Crawling (depth {depth}/{effective_max_depth}): {current_url}")
+
+        try:
+            response = session.get(current_url, timeout=REQUEST_TIMEOUT)
+            if response.status_code != 200:
+                print(f"[-] HTTP {response.status_code} for {current_url}", file=sys.stderr)
+                continue
+
+            content_type = response.headers.get('Content-Type', '').lower()
+            if 'text/html' not in content_type:
+                # Target URL itself might be a direct image
+                if is_valid_image_url(current_url):
+                    if download_image(current_url, save_dir, session, downloaded_hashes):
+                        total_downloaded += 1
+                continue
+
+            img_urls, next_page_urls = extract_page_assets(current_url, response.text, base_netloc)
+
+            for img_url in img_urls:
+                if img_url not in discovered_images:
+                    discovered_images.add(img_url)
+                    if download_image(img_url, save_dir, session, downloaded_hashes):
+                        total_downloaded += 1
+
+            if recursive and depth < effective_max_depth:
+                for next_url in next_page_urls:
+                    if next_url not in visited_pages:
+                        queue.append((next_url, depth + 1))
+
+        except Exception as e:
+            print(f"[-] Error fetching {current_url}: {e}", file=sys.stderr)
+
+    print(f"[*] Crawl finished. Visited {len(visited_pages)} page(s). Downloaded {total_downloaded} unique image(s).")
+
+
+def main():
+    args = parse_arguments()
+    crawl(
+        start_url=args.url,
+        recursive=args.recursive,
+        max_depth=args.depth,
+        save_dir=args.path
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""
+Scorpion: Image metadata and EXIF parser for 42 Cybersecurity Piscine.
+"""
+
+import os
+import sys
+import argparse
+import datetime
+import mimetypes
+from PIL import Image
+from PIL.ExifTags import TAGS, GPSTAGS
+
+VALID_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.bmp')
+
+
+def format_file_size(size_in_bytes):
+    """Format raw byte size into human-readable string."""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_in_bytes < 1024.0:
+            return f"{size_in_bytes:.2f} {unit}"
+        size_in_bytes /= 1024.0
+    return f"{size_in_bytes:.2f} TB"
+
+
+def get_basic_attributes(filepath):
+    """Retrieve filesystem attributes for a given file path."""
+    stat_info = os.stat(filepath)
+    file_size_str = format_file_size(stat_info.st_size)
+    mod_time = datetime.datetime.fromtimestamp(stat_info.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+    creation_timestamp = getattr(stat_info, 'st_birthtime', stat_info.st_ctime)
+    creation_time = datetime.datetime.fromtimestamp(creation_timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    mime_type, _ = mimetypes.guess_type(filepath)
+
+    return {
+        "File Path": os.path.abspath(filepath),
+        "File Name": os.path.basename(filepath),
+        "File Size": f"{stat_info.st_size} bytes ({file_size_str})",
+        "MIME Type": mime_type or "Unknown",
+        "Creation Date": creation_time,
+        "Modification Date": mod_time
+    }
+
+
+def parse_gps_data(gps_info_raw):
+    """Translate raw GPS EXIF tag dictionary into human-readable coordinates."""
+    gps_decoded = {}
+    for key, value in gps_info_raw.items():
+        sub_tag_name = GPSTAGS.get(key, key)
+        gps_decoded[sub_tag_name] = value
+
+    lat = gps_decoded.get("GPSLatitude")
+    lat_ref = gps_decoded.get("GPSLatitudeRef")
+    lon = gps_decoded.get("GPSLongitude")
+    lon_ref = gps_decoded.get("GPSLongitudeRef")
+
+    if lat and lat_ref and lon and lon_ref:
+        try:
+            lat_deg = float(lat[0]) + float(lat[1]) / 60.0 + float(lat[2]) / 3600.0
+            if lat_ref != "N":
+                lat_deg = -lat_deg
+            lon_deg = float(lon[0]) + float(lon[1]) / 60.0 + float(lon[2]) / 3600.0
+            if lon_ref != "E":
+                lon_deg = -lon_deg
+            gps_decoded["Formatted Coordinates"] = f"{lat_deg:.6f}, {lon_deg:.6f} ({lat_ref} {lon_ref})"
+        except Exception:
+            pass
+
+    return gps_decoded
+
+
+def extract_image_exif(image):
+    """Extract standard EXIF tags and decoded GPS dictionary from a PIL Image."""
+    exif_data = {}
+    gps_data = {}
+
+    raw_exif = image._getexif() if hasattr(image, '_getexif') else None
+    if raw_exif is not None:
+        for tag_id, value in raw_exif.items():
+            tag_name = TAGS.get(tag_id, tag_id)
+            if tag_name == "GPSInfo" and isinstance(value, dict):
+                gps_data = parse_gps_data(value)
+            else:
+                if isinstance(value, bytes):
+                    try:
+                        value = value.decode('utf-8', errors='replace').strip('\x00')
+                    except Exception:
+                        value = str(value)
+                exif_data[tag_name] = value
+
+    return exif_data, gps_data
+
+
+def strip_image_metadata(filepath):
+    """Bonus feature: strip and remove metadata from the target image file."""
+    try:
+        with Image.open(filepath) as img:
+            clean_image = Image.new(img.mode, img.size)
+            clean_image.paste(img)
+            clean_image.save(filepath)
+        print(f"[✔] Successfully stripped metadata from: {filepath}")
+        return True
+    except Exception as e:
+        print(f"[-] Failed to strip metadata from {filepath}: {e}", file=sys.stderr)
+        return False
+
+
+def display_metadata(filepath):
+    """Print structured basic attributes and EXIF metadata to the console."""
+    print("=" * 70)
+    print(f"  SCORPION METADATA REPORT: {os.path.basename(filepath)}")
+    print("=" * 70)
+
+    if not os.path.isfile(filepath):
+        print(f"Error: File not found: '{filepath}'", file=sys.stderr)
+        return
+
+    lower_path = filepath.lower()
+    if not any(lower_path.endswith(ext) for ext in VALID_EXTENSIONS):
+        print(f"Warning: '{filepath}' does not have a standard supported extension {VALID_EXTENSIONS}", file=sys.stderr)
+
+    basic_attrs = get_basic_attributes(filepath)
+    print("\n[+] BASIC FILE ATTRIBUTES:")
+    for key, value in basic_attrs.items():
+        print(f"    • {key:<20}: {value}")
+
+    try:
+        with Image.open(filepath) as img:
+            print("\n[+] IMAGE CHARACTERISTICS:")
+            print(f"    • {'Format':<20}: {img.format}")
+            print(f"    • {'Dimensions':<20}: {img.width} x {img.height} pixels")
+            print(f"    • {'Color Mode':<20}: {img.mode}")
+            print(f"    • {'Is Animated':<20}: {getattr(img, 'is_animated', False)}")
+
+            # Extract EXIF & GPS
+            exif_dict, gps_dict = extract_image_exif(img)
+
+            print("\n[+] EXIF METADATA:")
+            if exif_dict:
+                for tag_name, tag_val in sorted(exif_dict.items()):
+                    val_str = str(tag_val)
+                    if len(val_str) > 80:
+                        val_str = val_str[:77] + "..."
+                    print(f"    • {tag_name:<25}: {val_str}")
+            else:
+                print("    (No standard EXIF metadata present in this image)")
+
+            if gps_dict:
+                print("\n[+] GPS LOCATION METADATA:")
+                for gps_tag, gps_val in sorted(gps_dict.items()):
+                    print(f"    • {gps_tag:<25}: {gps_val}")
+
+            # Check for PNG or other text chunks
+            if hasattr(img, 'info') and img.info:
+                text_info = {k: v for k, v in img.info.items() if k not in ('exif', 'transparency') and isinstance(v, (str, int, float))}
+                if text_info:
+                    print("\n[+] EMBEDDED TEXT CHUNKS / INFO:")
+                    for info_key, info_val in text_info.items():
+                        print(f"    • {info_key:<25}: {info_val}")
+
+    except Exception as e:
+        print(f"\n[-] Could not parse image metadata: {e}", file=sys.stderr)
+
+    print()
+
+
+def parse_arguments():
+    """Parse command line arguments for scorpion."""
+    parser = argparse.ArgumentParser(
+        prog="scorpion",
+        description="Extract and parse EXIF and filesystem metadata from image files."
+    )
+    parser.add_argument(
+        "files",
+        nargs="+",
+        metavar="FILE",
+        help="One or more image files to analyze."
+    )
+    parser.add_argument(
+        "-d", "--delete",
+        action="store_true",
+        dest="delete_metadata",
+        help="Bonus: Strip and delete metadata from the specified image files."
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_arguments()
+
+    for file_path in args.files:
+        if args.delete_metadata:
+            strip_image_metadata(file_path)
+        else:
+            display_metadata(file_path)
+
+
+if __name__ == "__main__":
+    main()
