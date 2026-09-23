@@ -1,6 +1,4 @@
 __pycache__/
 .venv/
 data/
-*.download
-downloads/
-aranchida.pdf
+docs/
